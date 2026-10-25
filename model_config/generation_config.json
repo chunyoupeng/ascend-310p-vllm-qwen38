@@ -1,0 +1,7 @@
+{
+  "do_sample": false,
+  "repetition_penalty": 1.0001,
+  "temperature": 0.0,
+  "top_k": 20,
+  "top_p": 0.95
+}
