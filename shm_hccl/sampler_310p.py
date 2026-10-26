@@ -1,4 +1,3 @@
-from collections import Counter
 import torch
 import vllm.envs as envs
 from vllm._custom_ops import apply_repetition_penalties
@@ -7,8 +6,10 @@ from vllm.model_executor.layers.utils import get_token_bin_counts_and_mask
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
+import vllm_ascend.sample.rejection_sampler as _rs_mod
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
 from vllm_ascend.sample.sampler import (
@@ -24,7 +25,7 @@ _PROMPT_META_CACHE_310P: dict[tuple[int, tuple[int, ...], int, int], tuple[torch
 
 def _get_default_npu_generator_310p(device: torch.device) -> torch.Generator:
     global _DEFAULT_NPU_GEN_310P
-    if _DEFAULT_NPU_GEN_310P is None:
+    if _DEFAULT_NPU_GEN_310P is None or _DEFAULT_NPU_GEN_310P.device != device:
         _DEFAULT_NPU_GEN_310P = torch.Generator(device=device)
         _DEFAULT_NPU_GEN_310P.manual_seed(20260417)
     return _DEFAULT_NPU_GEN_310P
@@ -65,6 +66,30 @@ def fill_exponential_310p(
         for i, generator in generators.items():
             npu_gen = _get_npu_generator_310p(i, generator, q.device)
             q[i].exponential_(generator=npu_gen)
+
+
+def generate_uniform_probs_310p(
+    num_tokens: int,
+    num_draft_tokens: list[int],
+    generators: dict[int, torch.Generator],
+    device: torch.device,
+) -> torch.Tensor:
+    """TP-synchronized FP32 uniform random numbers on NPU (avoids AICPU FP64 & TP RNG desync)."""
+    default_gen = _get_default_npu_generator_310p(device)
+    uniform_probs = torch.empty((num_tokens,), dtype=torch.float32, device=device)
+    uniform_probs.uniform_(1e-6, 1.0, generator=default_gen)
+    if generators:
+        start_idx = 0
+        for req_idx, n in enumerate(num_draft_tokens):
+            if n == 0:
+                continue
+            end_idx = start_idx + n
+            gen = generators.get(req_idx)
+            if gen is not None:
+                npu_gen = _get_npu_generator_310p(req_idx, gen, device)
+                uniform_probs[start_idx:end_idx].uniform_(1e-6, 1.0, generator=npu_gen)
+            start_idx = end_idx
+    return uniform_probs
 
 
 def _random_sample_310p(
@@ -115,47 +140,6 @@ def _get_prompt_meta_310p(
     return has_explicit, prompt_mask
 
 
-def _detect_tail_loop_penalties_310p(
-    output_token_ids: list[list[int]],
-    vocab_size: int,
-    start_idx: int,
-) -> list[tuple[int, int, float]]:
-    """Return list of (row_idx, local_token_idx, penalty_to_subtract) ONLY when a repetition loop occurs."""
-    end_idx = start_idx + vocab_size
-    penalties: list[tuple[int, int, float]] = []
-    for row_idx, seq in enumerate(output_token_ids):
-        n = len(seq)
-        if n < 6:
-            continue
-        row_pen: dict[int, float] = {}
-        tail = seq[-96:] if n > 96 else seq
-        tlen = len(tail)
-        # 1. Exact periodic n-gram repeat at the tail (period k in 1..24)
-        max_k = min(24, tlen // 2)
-        for k in range(1, max_k + 1):
-            if tail[-k:] == tail[-2 * k : -k]:
-                triple = (tlen >= 3 * k) and (tail[-3 * k : -2 * k] == tail[-k:])
-                next_tok = tail[-k]
-                if start_idx <= next_tok < end_idx:
-                    c = next_tok - start_idx
-                    row_pen[c] = max(row_pen.get(c, 0.0), 12.0 if triple else 5.0)
-                if triple:
-                    for tok in set(tail[-k:]):
-                        if start_idx <= tok < end_idx:
-                            c = tok - start_idx
-                            row_pen[c] = max(row_pen.get(c, 0.0), 8.0)
-        # 2. High-frequency burst in the last 32 tokens (token appears >= 5 times)
-        short_tail = tail[-32:]
-        counts = Counter(short_tail)
-        for tok, cnt in counts.items():
-            if cnt >= 5 and start_idx <= tok < end_idx:
-                c = tok - start_idx
-                row_pen[c] = max(row_pen.get(c, 0.0), (cnt - 4) * 1.5)
-        for c, val in row_pen.items():
-            penalties.append((row_idx, c, val))
-    return penalties
-
-
 def _apply_penalties_sharded_310p(
     logits: torch.Tensor,
     prompt_token_ids: torch.Tensor,
@@ -174,15 +158,6 @@ def _apply_penalties_sharded_310p(
         start_idx = rank * vocab_size
     else:
         start_idx = 0
-
-    # Fast surgical loop-breaker on CPU tail (0 NPU overhead when no loop)
-    if output_token_ids:
-        loop_penalties = _detect_tail_loop_penalties_310p(output_token_ids, vocab_size, start_idx)
-        if loop_penalties:
-            rows = [p[0] for p in loop_penalties]
-            cols = [p[1] for p in loop_penalties]
-            vals = torch.tensor([p[2] for p in loop_penalties], dtype=logits.dtype, device=logits.device)
-            logits[rows, cols] -= vals
 
     has_explicit_penalties, base_prompt_mask = _get_prompt_meta_310p(
         prompt_token_ids,
@@ -267,8 +242,265 @@ def _ascend_rejection_sampler_apply_penalties_310p(
     )
 
 
+def _prepare_sampling_rejection_310p(self, top_k):
+    self.top_k = top_k if top_k is not None else None
+    if hasattr(self, "sampler") and hasattr(self.sampler, "prepare_sampling"):
+        self.sampler.prepare_sampling(top_k)
+
+
+def _sample_recovered_tokens_310p(
+    max_spec_len: int,
+    num_draft_tokens: list[int],
+    cu_num_draft_tokens: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    draft_probs: torch.Tensor | None,
+    target_probs: torch.Tensor,
+    sampling_metadata: SamplingMetadata,
+    device: torch.device,
+    use_block_verify: bool = False,
+    target_indices: torch.Tensor | None = None,
+    global_vocab_size: int | None = None,
+    enable_reduce_sampling: bool = False,
+) -> torch.Tensor:
+    num_tokens, vocab_size = target_probs.shape
+    q = torch.empty((num_tokens, vocab_size), dtype=torch.float32, device=device)
+    default_gen = _get_default_npu_generator_310p(device)
+    q.exponential_(generator=default_gen)
+    if sampling_metadata.generators:
+        start_idx = 0
+        for req_idx, n in enumerate(num_draft_tokens):
+            if n == 0:
+                continue
+            end_idx = start_idx + n
+            gen = sampling_metadata.generators.get(req_idx)
+            if gen is not None:
+                npu_gen = _get_npu_generator_310p(req_idx, gen, device)
+                q[start_idx:end_idx].exponential_(generator=npu_gen)
+            start_idx = end_idx
+
+    recovered_token_ids = torch.empty_like(draft_token_ids)
+    _sample_recovered_tokens_pytorch_310p(
+        recovered_token_ids,
+        cu_num_draft_tokens,
+        draft_token_ids,
+        draft_probs,
+        target_probs,
+        q,
+        vocab_size,
+        IS_NGRAM=draft_probs is None,
+        target_indices=target_indices,
+        enable_reduce_sampling=enable_reduce_sampling,
+    )
+    return recovered_token_ids
+
+
+def _sample_recovered_tokens_pytorch_310p(
+    output_token_ids,
+    cu_num_draft_tokens,
+    draft_token_ids,
+    draft_probs,
+    target_probs,
+    q,
+    vocab_size,
+    IS_NGRAM=False,
+    target_indices=None,
+    enable_reduce_sampling=False,
+):
+    device = output_token_ids.device
+    num_tokens = output_token_ids.shape[0]
+    if num_tokens == 0:
+        return
+
+    if q.shape[0] == num_tokens:
+        q_values = q
+    elif q.shape[0] == 1:
+        q_values = q.expand(num_tokens, vocab_size)
+    else:
+        cu_start = torch.nn.functional.pad(cu_num_draft_tokens[:-1], (1, 0), value=0)
+        token_indices = torch.arange(num_tokens, device=device)[:, None]
+        in_range_mask = (token_indices >= cu_start[None, :]) & (token_indices < cu_num_draft_tokens[None, :])
+        token_to_batch = torch.argmax(in_range_mask.int(), dim=1)
+        q_values = q[token_to_batch]
+
+    if enable_reduce_sampling:
+        if IS_NGRAM:
+            prob = target_probs
+        else:
+            flat_indices = target_indices.flatten()
+            token_offsets = torch.arange(num_tokens, device=device)[:, None] * draft_probs.shape[1]
+            flat_token_offsets = token_offsets.expand_as(target_indices).flatten()
+            draft_probs_flat = draft_probs.flatten()
+            valid_mask = flat_indices < draft_probs.shape[1]
+            flat_draft_probs_at_indices = torch.where(
+                valid_mask, draft_probs_flat[flat_token_offsets + flat_indices], 0.0
+            )
+            draft_probs_at_indices = flat_draft_probs_at_indices.view(num_tokens, vocab_size)
+            prob = torch.clamp_min(target_probs - draft_probs_at_indices, 0.0)
+    else:
+        if IS_NGRAM:
+            prob = target_probs
+        else:
+            prob = torch.clamp_min(target_probs - draft_probs, 0.0)
+
+    q_values_safe = torch.clamp_min(q_values, 1e-10)
+    prob_over_q = prob / q_values_safe
+
+    if enable_reduce_sampling:
+        indices = torch.argmax(prob_over_q, dim=1)
+        output_token_ids[:] = target_indices.gather(1, indices.unsqueeze(1)).squeeze(1)
+    else:
+        output_token_ids[:] = torch.argmax(prob_over_q, dim=1)
+
+
+def _rejection_random_sample_pytorch_310p(
+    output_token_ids,
+    cu_num_draft_tokens,
+    draft_token_ids,
+    draft_probs,
+    target_probs,
+    bonus_token_ids,
+    recovered_token_ids,
+    uniform_probs,
+    is_greedy,
+    max_spec_len,
+    vocab_size,
+    IS_NGRAM=False,
+    target_indices=None,
+    enable_reduce_sampling=False,
+    ENTROPY_VERIFY=False,
+    POSTERIOR_THRESHOLD=0.95,
+    POSTERIOR_ALPHA=0.4,
+    EPSILON=1e-10,
+    ori_target_probs=None,
+):
+    batch_size = output_token_ids.shape[0]
+    device = output_token_ids.device
+
+    cu_start = torch.nn.functional.pad(cu_num_draft_tokens[:-1], (1, 0), value=0)
+    num_draft_per_batch = cu_num_draft_tokens - cu_start
+
+    max_draft_len = max_spec_len
+    pos_indices = torch.arange(max_draft_len, device=device)[None, :]
+
+    valid_mask = pos_indices < num_draft_per_batch[:, None]
+    global_token_indices = (cu_start[:, None] + pos_indices).clamp(0, draft_token_ids.shape[0] - 1)
+    draft_tokens = draft_token_ids[global_token_indices]
+    placeholder_mask = draft_tokens == PLACEHOLDER_TOKEN_ID
+    safe_draft_tokens = draft_tokens.masked_fill(placeholder_mask, 0)
+
+    if enable_reduce_sampling:
+        flat_global_indices = global_token_indices.flatten()
+        flat_draft_tokens = draft_tokens.flatten().unsqueeze(1)
+        flat_target_indices = target_indices[flat_global_indices]
+        flat_target_probs = target_probs[flat_global_indices]
+        is_in_candidates = flat_target_indices == flat_draft_tokens
+        target_token_probs = (flat_target_probs * is_in_candidates).sum(dim=1).view(batch_size, max_draft_len)
+    else:
+        flat_indices = global_token_indices.flatten()
+        flat_draft_tokens = safe_draft_tokens.flatten()
+        target_token_probs = target_probs[flat_indices, flat_draft_tokens].view(batch_size, max_draft_len)
+
+    uniform_token_probs = uniform_probs[global_token_indices]
+    recovered_tokens = recovered_token_ids[global_token_indices]
+
+    if IS_NGRAM:
+        acceptance_condition = (target_token_probs >= uniform_token_probs) | (draft_tokens == recovered_tokens)
+    else:
+        flat_indices = global_token_indices.flatten()
+        flat_draft_tokens = safe_draft_tokens.flatten()
+        draft_token_probs = draft_probs[flat_indices, flat_draft_tokens].view(batch_size, max_draft_len)
+        acceptance_condition = (draft_token_probs > 0.0) & (
+            target_token_probs / draft_token_probs >= uniform_token_probs
+        )
+    acceptance_condition = acceptance_condition & (~placeholder_mask)
+
+    first_rejection = (~acceptance_condition) & valid_mask
+    default_pos = torch.full((batch_size, 1), max_draft_len, dtype=torch.long, device=device)
+    first_reject_pos = torch.where(
+        first_rejection.any(dim=1, keepdim=True),
+        first_rejection.int().argmax(dim=1, keepdim=True),
+        default_pos,
+    )
+    pos_mask = pos_indices >= first_reject_pos
+    should_skip = pos_mask & valid_mask
+
+    final_acceptance = acceptance_condition & (~should_skip)
+    non_greedy_mask = ~is_greedy
+    update_mask = non_greedy_mask[:, None] & valid_mask & (~should_skip)
+
+    first_reject_mask = (pos_indices == first_reject_pos) & valid_mask & non_greedy_mask[:, None]
+    final_update_mask = update_mask | first_reject_mask
+    final_tokens = torch.where(
+        first_reject_mask,
+        recovered_tokens,
+        torch.where(final_acceptance, draft_tokens, output_token_ids[:, :max_draft_len]),
+    )
+
+    output_token_ids[:, :max_draft_len] = torch.where(
+        final_update_mask, final_tokens, output_token_ids[:, :max_draft_len]
+    )
+
+    no_rejection = first_reject_pos.squeeze(1) >= num_draft_per_batch
+    should_add_bonus = non_greedy_mask & no_rejection
+    bonus_positions = num_draft_per_batch
+    seq_len = output_token_ids.shape[1]
+    all_positions = torch.arange(seq_len, device=device)[None, :]
+    valid_bonus_pos = bonus_positions < (max_spec_len + 1)
+    final_bonus_mask = should_add_bonus & valid_bonus_pos
+    bonus_pos_mask = (all_positions == bonus_positions[:, None]) & final_bonus_mask[:, None]
+    bonus_values_expanded = bonus_token_ids.view(-1, 1).expand(-1, seq_len)
+    output_token_ids[:] = torch.where(bonus_pos_mask, bonus_values_expanded, output_token_ids)
+
+
+def _expand_pytorch_310p(
+    output_ptr,
+    input_ptr,
+    cu_num_tokens_ptr,
+    replace_from,
+    replace_to,
+    MAX_NUM_TOKENS,
+):
+    device = cu_num_tokens_ptr.device
+    batch_size = input_ptr.shape[0]
+    num_tokens = output_ptr.shape[0]
+    if batch_size == 0 or num_tokens == 0:
+        return
+    if batch_size == 1:
+        val = torch.where(input_ptr == replace_from, replace_to, input_ptr)
+        output_ptr[:] = val[0]
+        return
+    cu_start = torch.nn.functional.pad(cu_num_tokens_ptr[:-1], (1, 0), value=0)
+    token_indices = torch.arange(num_tokens, device=device)[:, None]
+    in_range = (token_indices >= cu_start[None, :]) & (token_indices < cu_num_tokens_ptr[None, :])
+    replaced_input = torch.where(input_ptr == replace_from, replace_to, input_ptr).float()
+    token_values = torch.einsum("tb,b->t", in_range.float(), replaced_input)
+    needs_update = in_range.any(dim=1)
+    output_ptr[:] = torch.where(needs_update, token_values, output_ptr)
+
+
+_orig_rejection_forward_310p = AscendRejectionSampler.forward
+
+
+def _ascend_rejection_sampler_forward_310p(
+    self,
+    metadata: SpecDecodeMetadata,
+    draft_probs: torch.Tensor | None,
+    logits: torch.Tensor,
+    sampling_metadata: SamplingMetadata,
+):
+    _rs_mod.sample_recovered_tokens = _sample_recovered_tokens_310p
+    return _orig_rejection_forward_310p(self, metadata, draft_probs, logits, sampling_metadata)
+
+
 AscendSampler.apply_penalties = _ascend_sampler_apply_penalties_310p
 AscendRejectionSampler.apply_penalties = _ascend_rejection_sampler_apply_penalties_310p
+AscendRejectionSampler.prepare_sampling = _prepare_sampling_rejection_310p
+AscendRejectionSampler.forward = _ascend_rejection_sampler_forward_310p
+_rs_mod.generate_uniform_probs = generate_uniform_probs_310p
+_rs_mod.sample_recovered_tokens = _sample_recovered_tokens_310p
+_rs_mod.sample_recovered_tokens_pytorch = _sample_recovered_tokens_pytorch_310p
+_rs_mod.rejection_random_sample_pytorch = _rejection_random_sample_pytorch_310p
+_rs_mod.expand_pytorch = _expand_pytorch_310p
 
 
 class AscendTopKTopPSampler310(AscendTopKTopPSampler):
@@ -276,7 +508,8 @@ class AscendTopKTopPSampler310(AscendTopKTopPSampler):
         if envs.VLLM_BATCH_INVARIANT:
             return super().forward_native(logits, generators, k, p)
         if get_ascend_config().enable_reduce_sample:
-            cand_logits, cand_idx = self.apply_top_k_top_p(logits, k, p, self.top_k)
+            top_k = self.top_k if self.top_k is not None else 64
+            cand_logits, cand_idx = self.apply_top_k_top_p(logits, k, p, top_k)
             logits_to_return = None
             if self.logprobs_mode == "processed_logits":
                 logits_to_return = cand_logits
