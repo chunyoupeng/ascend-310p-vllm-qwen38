@@ -35,7 +35,7 @@ docker run -d --name qwen38-27b-async \
     --quantization ascend \
     --dtype float16 \
     --mamba-ssm-cache-dtype float16 \
-    --max-model-len 131072 \
+    --max-model-len 204800 \
     --kv-cache-memory 5368709120 \
     --enable-prefix-caching \
     --max-num-batched-tokens 8192 \
