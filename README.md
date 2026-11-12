@@ -22,7 +22,7 @@ High-performance multi-card Tensor Parallel (`TP=4`) inference suite for **Qwen3
    - Collapses sharded `greedy_sample` from 2× `dim=-1` `all_gather` into 1× transpose-free `dim=0` `[B, 2]` collective across both MTP draft and target verification, fuses `bonus + target` greedy verification into a single collective, and replaces `rejection_greedy_sample_pytorch` with a static-shape sync-free tensor kernel (eliminating 5 NPU-to-CPU stream syncs per step).
    - Fixes `apply_top_k_top_p` fallback when `self.top_k is None` on `temperature > 0` (avoiding `topk(62080)` and `9 MB` cross-card gathers) and coalesces candidate `(val, idx)` gathers.
    - Fixes physical Card ID (`NPU1,3,4,6`) to logical ID (`0,1,2,3`) mapping in `cpu_binding_310p.py` and prevents cross-socket `extend_numa`, pinning `TP0/1` to `NUMA 0` (`CPU 0-31`) and `TP2/3` to `NUMA 1` (`CPU 32-63`) with `migratepages`.
-   - Scales MTP speculative decoding to `num_speculative_tokens = 5` with aligned `cudagraph_capture_sizes = [6, 12, 18, 24, 36, 48, 72, 96]` (`scripts/s1_gdn_w8a8_opt.sh`).
+   - Uses `num_speculative_tokens = 3` by default (`cudagraph_capture_sizes = [4, 8, 12, 16, 24, 32, 48, 64]`, `270,434` KV cache tokens/node; pass `5` to `scripts/s1_gdn_w8a8_opt.sh 5` for low-entropy extractive workloads). On real `/v1/chat/completions` coding and creative tasks (`temperature=0.3, reasoning_effort=medium`), `MTP=3` outperforms `MTP=5` by `8%–19%` (`24.41` vs `20.55 tok/s` on `21.4K` real repo code audit; `25.38` vs `23.11 tok/s` on `6.7K` C++20 generation; `20.03` vs `18.61 tok/s` on `6.6K` English creative fiction).
 
 ## Single-Stream Performance (`TP=4`, `20K` Context Benchmark)
 
@@ -47,7 +47,8 @@ Measured via [`shm_hccl/bench_20k.py`](shm_hccl/bench_20k.py) (`~20,440` prompt 
 ## Directory Structure
 
 - `shm_hccl/`: C++ shared-memory HCCL library (`shm_hccl_v2.cpp`, `libshm_hccl_v2.so`), vLLM communicator/NUMA binding patches (`cpu_binding_310p.py`), 310P GDN/Embedding/W8A8 operators, and zero-sync sampler (`sampler_310p_v2.py`, `llm_base_proposer_v2.py`).
-- `scripts/s1_gdn_w8a8_opt.sh`: Optimized `MTP=5` container launch script (`scripts/s1_gdn_w8a8.sh` retained as `MTP=3` baseline).
+- `scripts/s1_gdn_w8a8_opt.sh`: Optimized `MTP=3` default container launch script (`bash s1_gdn_w8a8_opt.sh [num_spec]`; `scripts/s1_gdn_w8a8.sh` retained as unpatched baseline).
+- `scripts/vllm_router.py`: 4-node session/prefix-affinity gateway router (`x-session-id` + message-prefix sticky routing with `load_bias` deprioritizing co-located CV nodes).
 - `scripts/quantize_gdn_w8a8.py`: Parallel offline safetensors quantizer (`Qwen3.8-27B-w8a8-310p` -> `Qwen3.8-27B-w8a8-gdn-310p`).
 - `model_config/`: Updated `quant_model_description.json`, `generation_config.json`, and `config.json`.
 - `昇腾310P多卡vLLM部署与HCCL绕过实战指南.md`: Full technical guide and root-cause analysis.

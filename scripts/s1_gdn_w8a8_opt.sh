@@ -1,6 +1,6 @@
 #!/bin/bash
 set -e
-NUM_SPEC="${1:-5}"
+NUM_SPEC="${1:-3}"
 Q_LEN=$((NUM_SPEC + 1))
 CAPTURE_SIZES="[$(python3 -c "q=$Q_LEN; print(', '.join(str(q*b) for b in (1,2,3,4,6,8,12,16)))")]"
 echo "Launching qwen38-27b-async with num_speculative_tokens=${NUM_SPEC}, cudagraph_capture_sizes=${CAPTURE_SIZES}"
@@ -56,3 +56,7 @@ docker run -d --name qwen38-27b-async \
     --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3
 
 docker ps --format "{{.Names}}|{{.Status}}"
+
+if systemctl is-enabled --quiet car-counter.service 2>/dev/null; then
+  nohup bash -c 'for _ in $(seq 1 120); do curl -sf http://127.0.0.1:8000/health >/dev/null && exec systemctl start car-counter.service; sleep 3; done' >/dev/null 2>&1 &
+fi
