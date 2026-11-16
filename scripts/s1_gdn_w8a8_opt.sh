@@ -47,6 +47,8 @@ docker run -d --name qwen38-27b-async \
     --max-model-len 204800 \
     --kv-cache-memory 6442450944 \
     --enable-prefix-caching \
+    --enable-prompt-tokens-details \
+    --override-generation-config '{"temperature": 1.0}' \
     --max-num-batched-tokens 8192 \
     --max-num-seqs 16 \
     --async-scheduling \

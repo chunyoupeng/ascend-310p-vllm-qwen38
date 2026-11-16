@@ -327,7 +327,10 @@ def _sample_recovered_tokens_pytorch_310p(
 
     if enable_reduce_sampling:
         if IS_NGRAM:
-            prob = target_probs
+            valid_draft = (draft_token_ids != PLACEHOLDER_TOKEN_ID).unsqueeze(1)
+            draft_mask = (target_indices == draft_token_ids.to(target_indices.dtype).unsqueeze(1)) & valid_draft
+            prob = target_probs.masked_fill(draft_mask, 0.0)
+            prob = torch.where(prob.sum(dim=-1, keepdim=True) > 0.0, prob, target_probs)
         else:
             flat_indices = target_indices.flatten()
             token_offsets = torch.arange(num_tokens, device=device)[:, None] * draft_probs.shape[1]
@@ -341,7 +344,12 @@ def _sample_recovered_tokens_pytorch_310p(
             prob = torch.clamp_min(target_probs - draft_probs_at_indices, 0.0)
     else:
         if IS_NGRAM:
-            prob = target_probs
+            prob = target_probs.clone()
+            valid_draft = draft_token_ids != PLACEHOLDER_TOKEN_ID
+            safe_ids = draft_token_ids.to(torch.long).clamp(0, vocab_size - 1).unsqueeze(1)
+            draft_mask = torch.zeros_like(prob, dtype=torch.bool).scatter_(1, safe_ids, valid_draft.unsqueeze(1))
+            prob.masked_fill_(draft_mask, 0.0)
+            prob = torch.where(prob.sum(dim=-1, keepdim=True) > 0.0, prob, target_probs)
         else:
             prob = torch.clamp_min(target_probs - draft_probs, 0.0)
 
@@ -407,7 +415,7 @@ def _rejection_random_sample_pytorch_310p(
     recovered_tokens = recovered_token_ids[global_token_indices]
 
     if IS_NGRAM:
-        acceptance_condition = (target_token_probs >= uniform_token_probs) | (draft_tokens == recovered_tokens)
+        acceptance_condition = target_token_probs >= uniform_token_probs
     else:
         flat_indices = global_token_indices.flatten()
         flat_draft_tokens = safe_draft_tokens.flatten()
